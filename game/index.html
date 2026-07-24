@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Phone Sensor Monitor</title>
+    <title>Phone Beat Saber</title>
 
     <!-- p5.js from CDN -->
     <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
@@ -24,7 +24,14 @@
     </style>
   </head>
   <body>
-    <!-- Our sketch. p5.js auto-runs setup()/draw() defined here. -->
+    <!-- Order matters: each file uses what the ones above it define.
+         input.js  -> getSensorState()
+         saber.js  -> Saber      (calls getSensorState)
+         block.js  -> Block
+         sketch.js -> setup()/draw(), which p5 auto-runs. -->
+    <script src="input.js"></script>
+    <script src="saber.js"></script>
+    <script src="block.js"></script>
     <script src="sketch.js"></script>
   </body>
 </html>

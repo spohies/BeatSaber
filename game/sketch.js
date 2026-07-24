@@ -1,116 +1,261 @@
 // sketch.js
 //
-// A minimal p5.js monitor for phone sensor data relayed by the WebSocket bridge.
+// Main game loop: spawn blocks, track where the phone is pointing, score the slashes.
 //
-//   bridge (ws://localhost:8081)  -->  this page
+//   phone -> bridge -> input.js -> Pointer (screen cursor)
+//                                  Block[] -> hit / miss -> score
 //
-// The bridge forwards each OSC message as JSON: { address, args }.
-// We keep the latest args for every address and render them live.
+// Load order matters: p5, then input.js, saber.js, block.js, then this file.
 
-// --- WebSocket state --------------------------------------------------------
+// --- Tuning -----------------------------------------------------------------
 
-const WS_URL = "ws://localhost:8081";
+const SLICE_SPEED = 12; // px/frame of cursor motion that counts as a slice
+const SPAWN_INTERVAL = 1200; // ms between block spawns
+const LANE_COUNT = 4;
+const BLOCK_SPEED = 4; // pixels per frame
 
-let socket = null; // current WebSocket instance
-let connected = false; // true while the socket is open
+const HIT_TOLERANCE = 55; // ± pixels around the hit line that can be scored
+const POINTS_PER_HIT = 100;
+const SLICE_FLASH_MS = 350; // how long "SLICE!" stays on screen
 
-// Latest args keyed by OSC address, e.g. { "/ZIGSIM/accel": [0.1, -0.9, 0.2] }.
-// We use a plain object and read its keys each frame in draw().
-const latest = {};
+// --- State ------------------------------------------------------------------
 
-// Open (or re-open) the WebSocket and wire up its handlers.
-function connect() {
-  socket = new WebSocket(WS_URL);
+let pointer;
+let blocks = [];
+let lanes = []; // x centre of each lane
+let hitLineY = 0;
 
-  socket.onopen = () => {
-    connected = true;
-    console.log("WebSocket connected");
-  };
+let score = 0;
+let combo = 0;
+let bestCombo = 0;
 
-  socket.onmessage = (event) => {
-    // Each message is a JSON { address, args } object from the bridge.
-    try {
-      const data = JSON.parse(event.data);
-      if (data && data.address) {
-        // Store the most recent args for this address (replace, don't append).
-        latest[data.address] = data.args;
-      }
-    } catch (err) {
-      console.error("Bad message:", err);
-    }
-  };
+let lastSpawn = 0; // millis() of the last spawn
+let lastSliceAt = -Infinity; // millis() of the last successful hit
 
-  socket.onclose = () => {
-    connected = false;
-    console.log("WebSocket closed — retrying in 1s");
-    // Auto-reconnect after a short delay.
-    setTimeout(connect, 1000);
-  };
+let sliceSpeed = SLICE_SPEED; // live-tunable copy (arrow keys)
+let showDebug = true;
 
-  socket.onerror = () => {
-    // An error is normally followed by onclose, which handles the retry.
-    // Close here to be safe in case the socket is left half-open.
-    if (socket) socket.close();
-  };
+// --- Layout -----------------------------------------------------------------
+
+// Lane positions and the hit line derive from the window size, so this runs on
+// startup and again on every resize.
+function layout() {
+  hitLineY = height - 160;
+
+  lanes = [];
+  const laneWidth = width / (LANE_COUNT + 1);
+  for (let i = 1; i <= LANE_COUNT; i++) {
+    lanes.push(laneWidth * i);
+  }
 }
 
-// --- p5.js lifecycle --------------------------------------------------------
+// --- p5 lifecycle -----------------------------------------------------------
 
 function setup() {
   createCanvas(windowWidth, windowHeight);
   textFont("monospace");
-  connect();
+  layout();
+  pointer = new Pointer(width / 2, height / 2);
+  lastSpawn = millis();
 }
 
-// Keep the canvas filling the window when it's resized.
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  layout();
 }
 
 function draw() {
-  background(17); // matches the page's dark #111
+  background(17);
 
-  const margin = 20;
-  let y = margin + 20;
+  drawLanes();
+  drawHitLine();
 
-  // --- Connection status line ---
-  if (connected) {
-    fill(80, 220, 120); // green
-    textSize(18);
-    text("● connected to " + WS_URL, margin, y);
-  } else {
-    fill(220, 180, 80); // amber
-    textSize(18);
-    text("○ waiting for bridge at " + WS_URL + " ...", margin, y);
+  // Pointer updates before blocks so hit tests use this frame's cursor position.
+  pointer.update();
+
+  spawnIfDue();
+  updateBlocks();
+
+  pointer.draw();
+  drawHud();
+}
+
+// --- Spawning ---------------------------------------------------------------
+
+function spawnIfDue() {
+  if (millis() - lastSpawn < SPAWN_INTERVAL) return;
+  lastSpawn = millis();
+  blocks.push(new Block(random(lanes), BLOCK_SPEED));
+}
+
+// --- Update, hit detection, scoring -----------------------------------------
+
+// Walk backwards so removing a block doesn't skip the next one.
+function updateBlocks() {
+  // Speed is measured on the cursor's own screen motion — the gyro no longer
+  // gates hits at all.
+  const slicing = pointer.cursorSpeed > sliceSpeed;
+
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    block.update();
+
+    if (block.state === "incoming") {
+      if (slicing && block.inHitZone(hitLineY, HIT_TOLERANCE) && pointerCrosses(block)) {
+        registerHit(block);
+        blocks.splice(i, 1);
+        continue;
+      }
+
+      // Fallen past the scoreable window without being cut.
+      if (block.y > hitLineY + HIT_TOLERANCE) {
+        registerMiss(block);
+      }
+    }
+
+    block.draw();
+
+    if (block.isOffScreen(height)) {
+      blocks.splice(i, 1);
+    }
+  }
+}
+
+// Is the pointer inside the block's bounds? Tested along the cursor's whole path
+// this frame, not just its final position: a fast flick can jump 100+ px between
+// frames and would otherwise tunnel straight through the block without scoring.
+// The last sample is the current position, so this is a superset of the simple
+// point-in-bounds test.
+function pointerCrosses(block) {
+  const half = block.size / 2;
+  const samples = 6;
+
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const x = lerp(pointer.prevX, pointer.x, t);
+    const y = lerp(pointer.prevY, pointer.y, t);
+    if (Math.abs(x - block.x) <= half && Math.abs(y - block.y) <= half) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function registerHit(block) {
+  block.state = "hit";
+  combo += 1;
+  bestCombo = Math.max(bestCombo, combo);
+  score += POINTS_PER_HIT * combo;
+  lastSliceAt = millis();
+}
+
+function registerMiss(block) {
+  block.state = "missed";
+  combo = 0;
+}
+
+// --- Rendering --------------------------------------------------------------
+
+function drawLanes() {
+  stroke(32, 34, 42);
+  strokeWeight(1);
+  for (const x of lanes) {
+    line(x, 0, x, height);
+  }
+}
+
+function drawHitLine() {
+  // The scoreable band, then the line itself.
+  noStroke();
+  fill(255, 255, 255, 8);
+  rect(0, hitLineY - HIT_TOLERANCE, width, HIT_TOLERANCE * 2);
+
+  stroke(120, 200, 255, 160);
+  strokeWeight(2);
+  line(0, hitLineY, width, hitLineY);
+}
+
+function drawHud() {
+  noStroke();
+
+  fill(235);
+  textSize(28);
+  textAlign(LEFT, TOP);
+  text(`SCORE ${score}`, 24, 24);
+
+  fill(combo > 0 ? color(120, 220, 255) : color(120));
+  textSize(20);
+  text(`COMBO ${combo}`, 24, 60);
+
+  // Always-visible help: recentering is the one control a player must know about.
+  fill(130);
+  textSize(14);
+  text("press C to recenter pointer", 24, 92);
+
+  // Brief centred flash on a successful slice.
+  const sinceSlice = millis() - lastSliceAt;
+  if (sinceSlice < SLICE_FLASH_MS) {
+    const fade = 1 - sinceSlice / SLICE_FLASH_MS;
+    fill(255, 255, 255, 255 * fade);
+    textSize(52);
+    textAlign(CENTER, CENTER);
+    text("SLICE!", width / 2, height * 0.35);
   }
 
-  y += 36;
+  if (showDebug) drawDebug();
+}
 
-  // --- Address list with latest values ---
+// Live sensor readout — this is what you tune the thresholds against.
+function drawDebug() {
+  const state = getSensorState();
+  const aim = getPointer();
+
+  textAlign(RIGHT, TOP);
   textSize(14);
 
-  const addresses = Object.keys(latest).sort();
+  fill(state.connected ? color(80, 220, 120) : color(220, 180, 80));
+  text(state.connected ? "● bridge connected" : "○ waiting for bridge", width - 24, 24);
 
-  if (addresses.length === 0) {
-    fill(140);
-    text("(no sensor data yet)", margin, y);
-    return;
-  }
+  fill(aim.valid ? color(160) : color(220, 120, 120));
+  text(aim.valid ? "quaternion ok" : "no quaternion", width - 24, 46);
 
-  for (const address of addresses) {
-    const args = latest[address];
+  fill(160);
+  text(`pointer ${pointer.x.toFixed(0)}, ${pointer.y.toFixed(0)}`, width - 24, 64);
+  text(`yaw ${degrees(aim.yaw).toFixed(1)}°  pitch ${degrees(aim.pitch).toFixed(1)}°`, width - 24, 82);
+  text(`cursorSpeed ${pointer.cursorSpeed.toFixed(1)} px/f`, width - 24, 100);
+  text(`slice speed ${sliceSpeed.toFixed(1)}  (↑/↓)`, width - 24, 118);
+  text(`deg/screen ${pointer.degreesPerScreenX.toFixed(0)}°  ([/])`, width - 24, 136);
+  text(`minCutoff ${pointer.minCutoff.toFixed(2)}  (-/=)`, width - 24, 154);
+  text(`best combo ${bestCombo}`, width - 24, 172);
+  text("c: recenter  ·  d: hide debug", width - 24, 190);
 
-    // Format each arg: numbers to 3 decimals, anything else as-is.
-    const formatted = (Array.isArray(args) ? args : [args])
-      .map((v) => (typeof v === "number" ? v.toFixed(3) : String(v)))
-      .join("  ");
+  // Bar showing cursorSpeed against the slice threshold — flick and watch it
+  // cross the centre tick. This is what you tune SLICE_SPEED against.
+  const barW = 180;
+  const x = width - 24 - barW;
+  noStroke();
+  fill(40);
+  rect(x, 212, barW, 8, 4);
+  fill(pointer.cursorSpeed > sliceSpeed ? color(120, 240, 160) : color(90, 130, 190));
+  rect(x, 212, constrain(pointer.cursorSpeed / (sliceSpeed * 2), 0, 1) * barW, 8, 4);
+  fill(230);
+  rect(x + barW / 2 - 1, 208, 2, 16);
+}
 
-    fill(120, 200, 255); // address in blue
-    text(address, margin, y);
+// --- Input ------------------------------------------------------------------
 
-    fill(230); // values in light grey
-    text(formatted, margin + 280, y);
+function keyPressed() {
+  // Arrow keys retune the slice threshold live, the way they retuned the swing
+  // threshold in the Phase 0 monitor.
+  if (keyCode === UP_ARROW) sliceSpeed += 1;
+  if (keyCode === DOWN_ARROW) sliceSpeed = Math.max(0, sliceSpeed - 1);
+  if (key === "d" || key === "D") showDebug = !showDebug;
+  if (key === "c" || key === "C") pointer.recenter();
 
-    y += 22;
-  }
+  // Pointer feel: [ ] widen/narrow the rotation needed to cross the screen,
+  // - = trade cursor steadiness against lag.
+  if (key === "[") pointer.adjustDegreesPerScreen(-10);
+  if (key === "]") pointer.adjustDegreesPerScreen(10);
+  if (key === "-") pointer.adjustMinCutoff(-0.1);
+  if (key === "=") pointer.adjustMinCutoff(0.1);
 }

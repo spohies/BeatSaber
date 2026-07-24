@@ -1,131 +1,232 @@
 // saber.js
 //
-// One on-screen saber, driven by the phone's motion.
+// The player's on-screen cursor — a Wii-style pointer driven by where the phone
+// is aiming.
 //
-// The phone reports orientation and motion but never position, so the saber is
-// anchored at a fixed pivot and only its *angle* is under player control. Tilt
-// comes from the accelerometer (which senses gravity, an absolute reference, so
-// it never drifts) rather than from integrating the gyro (which always does).
+// Orientation comes from the quaternion, which is absolute: the phone's rotation
+// is measured against a reference orientation captured at recenter time, so the
+// cursor cannot drift or wind up. Nothing here integrates angular velocity.
 //
-// Requires input.js to be loaded first, for getSensorState().
+// Requires input.js to be loaded first, for getPointer(), setReference(),
+// getSensorState() and OneEuroFilter.
 
-// --- Tuning -----------------------------------------------------------------
+// --- Axis mapping -----------------------------------------------------------
 
-// How quickly the blade chases the phone's tilt. 0 = frozen, 1 = no smoothing
-// (jittery — the raw accelerometer is noisy).
-const SABER_SMOOTHING = 0.25;
-
-// During a swing the accelerometer mostly reads the swing's own acceleration
-// rather than gravity, so the derived tilt briefly goes wild — exactly when the
-// blade is most visible. Above this gyro magnitude we stop trusting it as much
-// and let the blade coast, which reads as a clean arc instead of a flail.
-const SABER_TRUST_GYRO = 2.0;
-const SABER_SMOOTHING_WHILE_SWINGING = 0.06;
-
-// Blade geometry, in pixels.
-const SABER_CORE_WEIGHT = 6;
-const SABER_GLOW_LAYERS = 4;
-
-// --- Tilt mapping -----------------------------------------------------------
-
-// Turn the gravity vector into an on-screen angle, where 0 = blade straight up
-// and positive = tilted clockwise (to the right).
+// Which rotation axis drives which screen axis. Each is "yaw", "pitch", or
+// "roll" — the three Tait-Bryan angles of the phone's rotation away from its
+// reference orientation.
 //
-// TROUBLESHOOTING: this is the one function to edit if the saber tilts the wrong
-// way or around the wrong axis — it depends entirely on how you hold the phone.
-// Swap which axes are read, or negate one, until an upright phone gives an
-// upright saber and tilting right tilts the blade right.
-function tiltAngleFromAccel(accel) {
-  return Math.atan2(accel.x, -accel.y);
-}
+// TROUBLESHOOTING, in this order:
+//   Cursor moves vertically when you pan the phone sideways?  swap these two.
+//   Cursor moves the right way but backwards?                 flip the INVERT below.
+// The correct combination depends entirely on how you hold the phone, so expect
+// to try a couple.
+const POINTER_AXIS_X = "pitch";
+const POINTER_AXIS_Y = "yaw";
 
-// --- Saber ------------------------------------------------------------------
+const POINTER_INVERT_X = false;
+const POINTER_INVERT_Y = false;
 
-class Saber {
-  // pivot (x, y) sits near the bottom of the screen; length is the blade length.
-  constructor(x, y, length) {
-    this.x = x;
+// --- Sensitivity ------------------------------------------------------------
+
+// Total rotation, in degrees, that spans the full width/height of the screen.
+// 90 means edge to edge is a 90° sweep — so ±45° from centre. Larger = calmer
+// and more physical movement; smaller = twitchier.
+const DEGREES_PER_SCREEN_X = 90;
+const DEGREES_PER_SCREEN_Y = 90;
+
+// --- Smoothing --------------------------------------------------------------
+
+// One Euro filter, applied to the rotation angles before they become pixels.
+// MIN_CUTOFF sets how steady the cursor is when held still — lower is steadier
+// but adds lag. BETA sets how quickly smoothing backs off as you move — raise it
+// if fast flicks feel like they drag behind your hand.
+const MIN_CUTOFF = 1.0;
+const BETA = 0.01;
+
+// Rotation smaller than this is treated as sensor noise and ignored outright, so
+// a phone lying still produces a perfectly stationary cursor.
+const POINTER_DEADZONE_DEG = 0.2;
+
+// --- Appearance -------------------------------------------------------------
+
+// Trail length in frames. Long enough that a flick reads as a slash, short enough
+// that it doesn't smear while aiming.
+const POINTER_TRAIL_LENGTH = 12;
+
+const RECENTER_FLASH_MS = 600;
+
+// --- Pointer ----------------------------------------------------------------
+
+class Pointer {
+  constructor(x, y) {
+    this.x = x; // on-screen position
     this.y = y;
-    this.length = length;
+    this.prevX = x; // position last frame, for velocity
+    this.prevY = y;
 
-    this.angle = 0; // current on-screen angle, radians, 0 = up
-    this.gyroMag = 0; // rotation speed this frame
-    this.swingDir = 0; // -1, 0, or +1 — rough direction of the current swing
+    this.cursorSpeed = 0; // px/frame the cursor is travelling
+    this.gyroMag = 0; // phone rotation speed (not used for scoring)
+    this.valid = false; // false until a usable quaternion arrives
 
-    // Blade tip, recomputed each update(). Handy for hit effects and Phase 2.
-    this.tipX = x;
-    this.tipY = y - length;
+    // Live-tunable copies of the constants above, so they can be dialled in from
+    // the keyboard without editing the file.
+    this.degreesPerScreenX = DEGREES_PER_SCREEN_X;
+    this.degreesPerScreenY = DEGREES_PER_SCREEN_Y;
+    this.minCutoff = MIN_CUTOFF;
+
+    // One filter per screen axis — they see different signals.
+    this.filterX = new OneEuroFilter(MIN_CUTOFF, BETA);
+    this.filterY = new OneEuroFilter(MIN_CUTOFF, BETA);
+
+    // Last angles that cleared the deadzone, in radians.
+    this.heldAngleX = 0;
+    this.heldAngleY = 0;
+
+    this.trail = [];
+    this.recenteredAt = -Infinity;
   }
 
   update() {
-    const state = getSensorState();
-    this.gyroMag = state.gyroMag;
+    this.gyroMag = getSensorState().gyroMag;
 
-    // Chase the phone's tilt, easing off while swinging (see SABER_TRUST_GYRO).
-    const target = tiltAngleFromAccel(state.accel);
-    const smoothing =
-      this.gyroMag > SABER_TRUST_GYRO
-        ? SABER_SMOOTHING_WHILE_SWINGING
-        : SABER_SMOOTHING;
-    this.angle += shortestAngleTo(this.angle, target) * smoothing;
+    const aim = getPointer();
+    this.valid = aim.valid;
 
-    // Direction of the dominant gyro axis. Only updated while actually moving,
-    // so it holds the last real swing's direction instead of chasing noise.
-    if (this.gyroMag > SABER_TRUST_GYRO) {
-      this.swingDir = Math.sign(dominantAxis(state.gyro));
+    if (aim.valid) {
+      const now = millis();
+
+      // Pick the rotation axis feeding each screen axis, then smooth it while
+      // it's still an angle — filtering in pixels would fight the clamp at the
+      // screen edges.
+      const rawX = this.filterX.filter(aim[POINTER_AXIS_X], now);
+      const rawY = this.filterY.filter(aim[POINTER_AXIS_Y], now);
+
+      const angleX = this.applyDeadzone(rawX, "heldAngleX");
+      const angleY = this.applyDeadzone(rawY, "heldAngleY");
+
+      // DEGREES_PER_SCREEN is the *total* sweep, so half of it reaches an edge.
+      const halfRangeX = radians(this.degreesPerScreenX / 2);
+      const halfRangeY = radians(this.degreesPerScreenY / 2);
+
+      const nx = (POINTER_INVERT_X ? -angleX : angleX) / halfRangeX;
+      const ny = (POINTER_INVERT_Y ? -angleY : angleY) / halfRangeY;
+
+      // Clamp to the canvas so the cursor can't be lost off-screen — with a
+      // relative reference it would otherwise be hard to find again.
+      this.x = constrain(width / 2 + nx * (width / 2), 0, width);
+      this.y = constrain(height / 2 + ny * (height / 2), 0, height);
     }
 
-    // Screen y grows downward, so "up" from the pivot is -cos.
-    this.tipX = this.x + Math.sin(this.angle) * this.length;
-    this.tipY = this.y - Math.cos(this.angle) * this.length;
+    this.cursorSpeed = dist(this.x, this.y, this.prevX, this.prevY);
+
+    this.trail.push({ x: this.x, y: this.y });
+    if (this.trail.length > POINTER_TRAIL_LENGTH) this.trail.shift();
+
+    this.prevX = this.x;
+    this.prevY = this.y;
   }
 
+  // Hold the previous angle until the new one differs by more than the deadzone,
+  // so noise below that threshold moves the cursor not at all.
+  applyDeadzone(angle, heldField) {
+    if (Math.abs(angle - this[heldField]) > radians(POINTER_DEADZONE_DEG)) {
+      this[heldField] = angle;
+    }
+    return this[heldField];
+  }
+
+  // Phone rotating fast enough to count as a deliberate swing. Not used for
+  // scoring — kept because gyro speed is still a useful signal for Phase 2.
   isSwinging(threshold) {
     return this.gyroMag > threshold;
   }
 
-  draw() {
-    const swinging = this.isSwinging(SABER_TRUST_GYRO);
-
-    push();
-    // Glow: a few translucent strokes, widest and faintest first. Brighter and
-    // wider while swinging, which is the whole visual cue that a swing landed.
-    const glowScale = swinging ? 1.6 : 1.0;
-    for (let i = SABER_GLOW_LAYERS; i > 0; i--) {
-      const spread = i * 4 * glowScale;
-      stroke(120, 220, 255, 22 * glowScale);
-      strokeWeight(SABER_CORE_WEIGHT + spread);
-      line(this.x, this.y, this.tipX, this.tipY);
+  // Capture the current orientation as screen centre.
+  recenter() {
+    if (setReference()) {
+      this.recenteredAt = millis();
     }
+  }
 
-    // Bright core.
-    stroke(235, 250, 255);
-    strokeWeight(SABER_CORE_WEIGHT);
-    line(this.x, this.y, this.tipX, this.tipY);
+  // --- Live tuning ----------------------------------------------------------
 
-    // Hilt, so the pivot reads as a held object rather than a floating line.
-    stroke(90, 100, 115);
-    strokeWeight(SABER_CORE_WEIGHT + 6);
-    line(this.x, this.y, this.x - Math.sin(this.angle) * 22, this.y + Math.cos(this.angle) * 22);
+  // Both axes move together, which keeps the cursor's aspect feeling consistent.
+  adjustDegreesPerScreen(delta) {
+    this.degreesPerScreenX = constrain(this.degreesPerScreenX + delta, 10, 360);
+    this.degreesPerScreenY = constrain(this.degreesPerScreenY + delta, 10, 360);
+  }
+
+  adjustMinCutoff(delta) {
+    this.minCutoff = constrain(this.minCutoff + delta, 0.1, 20);
+    this.filterX.setMinCutoff(this.minCutoff);
+    this.filterY.setMinCutoff(this.minCutoff);
+  }
+
+  // --- Drawing --------------------------------------------------------------
+
+  draw() {
+    this.drawTrail();
+    this.drawCrosshair();
+    this.drawRecenterFlash();
+  }
+
+  // The trail is what makes a fast flick read as a slash rather than a teleport.
+  drawTrail() {
+    noFill();
+    for (let i = 1; i < this.trail.length; i++) {
+      const fade = i / this.trail.length;
+      stroke(120, 220, 255, 200 * fade * fade);
+      strokeWeight(10 * fade);
+      line(this.trail[i - 1].x, this.trail[i - 1].y, this.trail[i].x, this.trail[i].y);
+    }
+  }
+
+  drawCrosshair() {
+    push();
+    translate(this.x, this.y);
+
+    // Dimmed until real orientation data is flowing, so a dead sensor is obvious
+    // rather than looking like a cursor stuck at centre.
+    const alpha = this.valid ? 255 : 70;
+    const arm = 14;
+
+    stroke(235, 250, 255, alpha);
+    strokeWeight(2);
+    line(-arm, 0, -5, 0);
+    line(5, 0, arm, 0);
+    line(0, -arm, 0, -5);
+    line(0, 5, 0, arm);
+
+    noFill();
+    stroke(120, 220, 255, alpha);
+    strokeWeight(2);
+    circle(0, 0, 26);
+
+    noStroke();
+    fill(255, 255, 255, alpha);
+    circle(0, 0, 6);
     pop();
   }
-}
 
-// --- Helpers ----------------------------------------------------------------
+  drawRecenterFlash() {
+    const since = millis() - this.recenteredAt;
+    if (since > RECENTER_FLASH_MS) return;
 
-// Signed distance from angle a to angle b, wrapped into [-PI, PI]. Without this,
-// easing across the ±PI seam sends the blade the long way round.
-function shortestAngleTo(a, b) {
-  let diff = (b - a) % (Math.PI * 2);
-  if (diff > Math.PI) diff -= Math.PI * 2;
-  if (diff < -Math.PI) diff += Math.PI * 2;
-  return diff;
-}
+    const t = since / RECENTER_FLASH_MS;
 
-// The gyro component with the largest magnitude, sign intact.
-function dominantAxis(gyro) {
-  let largest = gyro.x;
-  if (Math.abs(gyro.y) > Math.abs(largest)) largest = gyro.y;
-  if (Math.abs(gyro.z) > Math.abs(largest)) largest = gyro.z;
-  return largest;
+    // Ring expanding from screen centre — where the cursor has just been sent.
+    push();
+    noFill();
+    stroke(120, 240, 180, 220 * (1 - t));
+    strokeWeight(3);
+    circle(width / 2, height / 2, 40 + t * 160);
+
+    noStroke();
+    fill(120, 240, 180, 255 * (1 - t));
+    textSize(18);
+    textAlign(CENTER, CENTER);
+    text("RECENTERED", width / 2, height / 2 + 60);
+    pop();
+  }
 }
