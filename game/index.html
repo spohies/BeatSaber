@@ -5,8 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Phone Beat Saber</title>
 
-    <!-- p5.js from CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+    <!-- p5.js from CDN.
+         crossorigin="anonymous" matters for debugging: without it, any
+         exception thrown inside p5 is cross-origin and the browser reports it
+         as a bare "Script error." with no file, line, or stack. jsDelivr sends
+         Access-Control-Allow-Origin, so this opts us into the real message. -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"
+      crossorigin="anonymous"
+    ></script>
 
     <style>
       /* Dark background, monospace everywhere, no scrollbars from the canvas. */
@@ -14,21 +21,210 @@
       body {
         margin: 0;
         padding: 0;
-        background: #111;
+        background: #080a12;
         font-family: "Courier New", Courier, monospace;
         overflow: hidden;
       }
       canvas {
         display: block;
       }
+
+      /* --- HUD -------------------------------------------------------------
+         The HUD is plain DOM sitting on top of the canvas, NOT drawn in WEBGL.
+         Two reasons: WEBGL text() needs a loaded font file, and compositing a
+         2D buffer into a 3D scene fights p5's material state (that fight is
+         what produced the full-screen white rectangle). DOM text is also
+         sharper and free to render. pointer-events:none so it never eats
+         clicks meant for the canvas. */
+      #hud {
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        color: #eaeaea;
+        z-index: 10;
+      }
+
+      #hud-left {
+        position: absolute;
+        top: 20px;
+        left: 24px;
+      }
+      #score {
+        font-size: 28px;
+        letter-spacing: 1px;
+      }
+      #combo {
+        font-size: 20px;
+        margin-top: 8px;
+        color: #78dcff;
+      }
+      #combo.zero {
+        color: #787878;
+      }
+      #hint {
+        font-size: 13px;
+        margin-top: 10px;
+        color: #828282;
+      }
+
+      /* Live sensor readout, top-right. This is the panel to watch while you
+         wave the phone around — if these numbers are frozen, the problem is
+         upstream of the game. */
+      #hud-right {
+        position: absolute;
+        top: 20px;
+        right: 24px;
+        text-align: right;
+        font-size: 13px;
+        line-height: 1.55;
+      }
+      #conn {
+        font-size: 13px;
+        margin-bottom: 6px;
+      }
+      #conn.ok {
+        color: #50dc78;
+      }
+      #conn.bad {
+        color: #dcb450;
+      }
+      #sensor {
+        margin: 0;
+        font-family: inherit;
+        font-size: 13px;
+        line-height: 1.55;
+        color: #b4c4d4;
+        white-space: pre;
+      }
+      #sensor .warn {
+        color: #dc7878;
+      }
+
+      /* Speed bar: cursorSpeed against the slice threshold. The tick is the
+         threshold — flick and watch the fill cross it. */
+      #speedbar {
+        margin-top: 10px;
+        margin-left: auto;
+        width: 180px;
+        height: 8px;
+        border-radius: 4px;
+        background: #282828;
+        position: relative;
+      }
+      #speedfill {
+        height: 100%;
+        width: 0%;
+        border-radius: 4px;
+        background: #5a82be;
+      }
+      #speedfill.slicing {
+        background: #78f0a0;
+      }
+      #speedtick {
+        position: absolute;
+        left: 50%;
+        top: -4px;
+        width: 2px;
+        height: 16px;
+        background: #e6e6e6;
+      }
+
+      /* Centre-screen flashes. Opacity is driven from sketch.js each frame. */
+      #flash,
+      #recenter {
+        position: absolute;
+        left: 0;
+        right: 0;
+        text-align: center;
+        opacity: 0;
+      }
+      #flash {
+        top: 26%;
+        font-size: 52px;
+        color: #ffffff;
+        text-shadow: 0 0 24px rgba(120, 220, 255, 0.9);
+      }
+      #recenter {
+        top: 50%;
+        font-size: 18px;
+        color: #78f0b4;
+      }
+
+      /* Crash overlay. A script that fails to parse takes its setup()/draw()
+         with it and p5 just shows a blank canvas — silent, and easy to
+         misread as "the sensor isn't working". This puts the real error
+         on screen instead. */
+      #err {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: none;
+        padding: 32px;
+        background: rgba(20, 4, 8, 0.94);
+        color: #ff9b9b;
+        font-size: 14px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        overflow: auto;
+      }
+      #err b {
+        color: #ffd7d7;
+        font-size: 18px;
+      }
     </style>
   </head>
   <body>
+    <div id="hud">
+      <div id="hud-left">
+        <div id="score">SCORE 0</div>
+        <div id="combo" class="zero">COMBO 0</div>
+        <div id="hint">press C to recenter saber</div>
+      </div>
+
+      <div id="hud-right">
+        <div id="conn" class="bad">○ waiting for bridge</div>
+        <pre id="sensor"></pre>
+        <div id="speedbar">
+          <div id="speedfill"></div>
+          <div id="speedtick"></div>
+        </div>
+      </div>
+
+      <div id="flash">SLICE!</div>
+      <div id="recenter">RECENTERED</div>
+    </div>
+
+    <div id="err"></div>
+
+    <script>
+      // Installed before the game scripts so it catches their load errors too.
+      // Only the first error is shown: once draw() starts throwing it throws
+      // every frame, and the first one is the real cause.
+      (function () {
+        var shown = false;
+        window.addEventListener("error", function (e) {
+          if (shown) return;
+          shown = true;
+          var box = document.getElementById("err");
+          box.style.display = "block";
+          box.innerHTML =
+            "<b>JavaScript error — the game stopped</b>\n\n" +
+            String(e.message) +
+            "\n\n" +
+            String(e.filename || "") +
+            " line " +
+            String(e.lineno || "?") +
+            "\n\n" +
+            (e.error && e.error.stack ? String(e.error.stack) : "");
+        });
+      })();
+    </script>
+
     <!-- Order matters: each file uses what the ones above it define.
-         input.js  -> getSensorState()
-         saber.js  -> Saber      (calls getSensorState)
-         block.js  -> Block
-         sketch.js -> setup()/draw(), which p5 auto-runs. -->
+         input.js  -> getSensorState(), getPointer(), getDiagnostics(), OneEuroFilter
+         saber.js  -> Saber      (3D blade; calls getPointer/getSensorState)
+         block.js  -> Block      (flies down the z axis)
+         sketch.js -> setup()/draw() in WEBGL, which p5 auto-runs. -->
     <script src="input.js"></script>
     <script src="saber.js"></script>
     <script src="block.js"></script>

@@ -8,8 +8,8 @@
 // "/ZIGSIM/<device-id>/gyro" — the sensor name is in there, but so is a per-device
 // id we don't control, so we match sensors by keyword rather than exact address.
 //
-// Plain JavaScript on purpose: no p5, no DOM. The game reads one function,
-// getSensorState(), once per frame.
+// Plain JavaScript on purpose: no p5, no DOM. The game reads getSensorState()
+// and getPointer(), once per frame.
 
 // --- Configuration ----------------------------------------------------------
 
@@ -33,11 +33,47 @@ const SENSOR_KEYWORDS = {
 // That is the single most likely cause, and it is a one-word change.
 const QUATERNION_ORDER = "wxyz"; // "wxyz" | "xyzw"
 
+// --- Grip -------------------------------------------------------------------
+//
+// The phone's sensor axes (CoreMotion / Android sensor frame, screen-relative):
+//   +X  out the right edge of the screen
+//   +Y  out the top of the phone (camera end)
+//   +Z  out of the screen's face
+//
+// Grip this game is tuned for: RIGHT hand, back of the phone in the palm, top
+// of the phone aimed at the monitor, screen facing LEFT. In that pose:
+//   device +Y (top)    -> points at the monitor  = the "barrel" of the pointer
+//   device +Z (screen) -> points left
+//   device +X (right)  -> points at the ceiling
+//
+// So the pointing direction is the device +Y axis, and "which way is up" on the
+// device is +X. Change these two vectors and every bit of math below adapts to
+// a different grip — e.g. classic portrait TV-remote grip (screen up, top at
+// the monitor) would be FORWARD [0,1,0], UP [0,0,1].
+const DEVICE_FORWARD = [0, 1, 0]; // device axis aimed at the screen
+const DEVICE_UP = [1, 0, 0]; // device axis facing the ceiling in this grip
+
+// Precomputed at load: the device axis pointing to the player's RIGHT in this
+// grip. forward × up in a right-handed frame gives it directly:
+// [0,1,0] × [1,0,0] = [0,0,-1] — i.e. out the *back* of the phone, which is
+// indeed the player's right when the screen faces left. Sanity checks out.
+const DEVICE_RIGHT = cross3(DEVICE_FORWARD, DEVICE_UP);
+
 // --- State ------------------------------------------------------------------
 
 let socket = null; // current WebSocket instance
 let connected = false; // true while the socket is open
 let reconnectTimer = null; // pending reconnect, so we never stack retries
+
+// Traffic counters, purely for the on-screen diagnostics. If packets is
+// climbing but the quaternion never becomes valid, the bridge is fine and the
+// problem is which sensors ZIG SIM has switched on.
+let messageCount = 0;
+let lastMessageAt = 0;
+let messageRate = 0; // messages/second, recomputed every RATE_WINDOW_MS
+let rateWindowStart = 0;
+let rateWindowCount = 0;
+const RATE_WINDOW_MS = 500;
 
 // Latest args keyed by OSC address, e.g. { "/ZIGSIM/abc/accel": [0.1, -0.9, 0.2] }.
 const latest = {};
@@ -74,6 +110,10 @@ function connect() {
 
       latest[data.address] = data.args;
       claimAddress(data.address);
+
+      messageCount += 1;
+      rateWindowCount += 1;
+      lastMessageAt = performance.now();
     } catch (err) {
       console.error("[input] bad message:", err);
     }
@@ -169,6 +209,33 @@ function getSensorState() {
 // Orientation is absolute, so "where is the phone aiming" is answered by
 // comparing the current orientation against a remembered one — no accumulation,
 // nothing to drift. Recentering is just replacing that remembered orientation.
+//
+// HOW THE AIM MATH WORKS (and why it isn't Euler-angle extraction):
+//
+// The phone reports q, a rotation from device coordinates to some world frame
+// we don't control. We captured qref the same way at recenter time. Then
+//
+//   qr = qref⁻¹ ⊗ q
+//
+// is the rotation from "device pose at recenter" to "device pose now",
+// expressed in the RECENTER pose's own device coordinates. That frame is the
+// one frame we actually know the meaning of, because the player was told to
+// aim at the screen centre when pressing C: in it, DEVICE_FORWARD points at
+// the screen, DEVICE_UP at the ceiling, DEVICE_RIGHT to the player's right.
+//
+// So we take the pointing axis DEVICE_FORWARD, rotate it by qr, and get f =
+// "where the barrel points now", measured in that known frame. Then:
+//
+//   yaw   = atan2(f · right, f · forward)   left/right swing of the barrel
+//   pitch = asin(f · up)                    elevation of the barrel
+//
+// Positive yaw = aiming right, positive pitch = aiming up.
+//
+// Compared with extracting Tait-Bryan angles from qr directly, this has two
+// wins: it needs no guessing about which Euler axis is "screen x" for a
+// sideways grip, and rolling the phone about its own barrel (which the wrist
+// does constantly mid-swing) moves the cursor not at all — the forward vector
+// is invariant under roll.
 
 // Remember the current orientation as screen centre. Returns false (and changes
 // nothing) if no usable quaternion has arrived yet.
@@ -180,10 +247,10 @@ function setReference() {
 }
 
 // Where the phone is aiming, relative to the reference orientation.
-// Returns { yaw, pitch, valid } with angles in radians.
+// Returns { yaw, pitch, roll, valid } in radians. +yaw = right, +pitch = up.
 function getPointer() {
   const q = readQuaternion();
-  if (q === null) return { yaw: 0, pitch: 0, valid: false };
+  if (q === null) return { yaw: 0, pitch: 0, roll: 0, valid: false };
 
   // First usable reading defines centre, so the pointer works before anyone
   // thinks to press C.
@@ -192,10 +259,26 @@ function getPointer() {
   // Rotation *from* the reference *to* now. For a unit quaternion the inverse
   // is just the conjugate.
   const qr = quatMultiply(quatConjugate(referenceQuat), q);
-  return { ...eulerFrom(qr), valid: true };
+
+  // Barrel direction now, in the recenter frame.
+  const f = quatRotateVector(qr, DEVICE_FORWARD);
+
+  const yaw = Math.atan2(dot3(f, DEVICE_RIGHT), dot3(f, DEVICE_FORWARD));
+
+  // Clamped because rounding can push the dot a hair outside asin's domain,
+  // which would return NaN and freeze the cursor permanently.
+  const pitch = Math.asin(Math.max(-1, Math.min(1, dot3(f, DEVICE_UP))));
+
+  // Roll = twist about the barrel. Not used for aiming (deliberately), but
+  // Phase 2's directional cuts will want it, and it's handy in the debug HUD.
+  // Rotate the device's up axis and see how far it has tipped toward "right".
+  const u = quatRotateVector(qr, DEVICE_UP);
+  const roll = Math.atan2(dot3(u, DEVICE_RIGHT), dot3(u, DEVICE_UP));
+
+  return { yaw, pitch, roll, valid: true };
 }
 
-// --- Quaternion maths -------------------------------------------------------
+// --- Quaternion & vector maths ----------------------------------------------
 
 function quatConjugate(q) {
   return [q[0], -q[1], -q[2], -q[3]];
@@ -212,22 +295,34 @@ function quatMultiply(a, b) {
   ];
 }
 
-// All three Tait-Bryan angles of a relative rotation, in radians. Which of these
-// corresponds to "left/right" versus "up/down" on screen depends on how the phone
-// is held, so all three are returned and the caller picks — see POINTER_AXIS_X
-// and POINTER_AXIS_Y in saber.js.
-function eulerFrom(q) {
-  const [w, x, y, z] = q;
+// Rotate vector v by unit quaternion q = (w, x, y, z).
+// Uses the expanded form  v' = v + 2w(qv × v) + 2(qv × (qv × v))
+// (qv = the quaternion's vector part), which is the standard cheap way to
+// compute q ⊗ v ⊗ q⁻¹ without building a rotation matrix.
+function quatRotateVector(q, v) {
+  const [w, qx, qy, qz] = q;
+  // t = 2 * (qv × v)
+  const tx = 2 * (qy * v[2] - qz * v[1]);
+  const ty = 2 * (qz * v[0] - qx * v[2]);
+  const tz = 2 * (qx * v[1] - qy * v[0]);
+  // v' = v + w*t + qv × t
+  return [
+    v[0] + w * tx + (qy * tz - qz * ty),
+    v[1] + w * ty + (qz * tx - qx * tz),
+    v[2] + w * tz + (qx * ty - qy * tx),
+  ];
+}
 
-  const yaw = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
-  const roll = Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+function dot3(a, b) {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
 
-  // Clamped because rounding can push this a hair outside asin's domain, which
-  // would return NaN and freeze the cursor permanently.
-  const sinPitch = Math.max(-1, Math.min(1, 2 * (w * y - z * x)));
-  const pitch = Math.asin(sinPitch);
-
-  return { yaw, pitch, roll };
+function cross3(a, b) {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
 }
 
 // --- One Euro filter --------------------------------------------------------
@@ -292,6 +387,31 @@ class OneEuroFilter {
 // Also the starting point for Phase 2's per-device routing.
 function getSensorAddresses() {
   return { seen: Object.keys(latest).sort(), bound: { ...sensorAddress } };
+}
+
+// Everything the on-screen panel needs to answer "is data actually arriving?".
+// Read this every frame; the packet rate is recomputed on a short window so it
+// reacts quickly without jittering.
+function getDiagnostics() {
+  const now = performance.now();
+
+  if (rateWindowStart === 0) rateWindowStart = now;
+  const elapsed = now - rateWindowStart;
+  if (elapsed >= RATE_WINDOW_MS) {
+    messageRate = (rateWindowCount * 1000) / elapsed;
+    rateWindowStart = now;
+    rateWindowCount = 0;
+  }
+
+  return {
+    connected,
+    messageCount,
+    messageRate,
+    msSinceLastMessage: lastMessageAt === 0 ? Infinity : now - lastMessageAt,
+    hasQuaternion: readQuaternion() !== null,
+    seen: Object.keys(latest).sort(),
+    bound: { ...sensorAddress },
+  };
 }
 
 // Connect as soon as the script loads — the game can start drawing before any

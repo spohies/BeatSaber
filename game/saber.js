@@ -1,29 +1,31 @@
 // saber.js
 //
-// The player's on-screen cursor — a Wii-style pointer driven by where the phone
-// is aiming.
+// The player's saber — a Wii-style pointer driven by where the phone is aiming,
+// rendered as a glowing 3D blade in WEBGL.
 //
 // Orientation comes from the quaternion, which is absolute: the phone's rotation
 // is measured against a reference orientation captured at recenter time, so the
 // cursor cannot drift or wind up. Nothing here integrates angular velocity.
 //
+// COORDINATES: the saber aims at a point on the "hit plane", the z = 0 plane
+// where blocks get sliced. Under p5's default WEBGL camera, 1 world unit on
+// that plane = 1 screen pixel, so this class does all its aiming math in plain
+// screen pixels (this.x / this.y, origin top-left, like 2D mode) and converts
+// to world coordinates (origin at screen centre) only at the end:
+//
+//   tipX = x - width/2,  tipY = y - height/2,  tipZ = 0
+//
+// That keeps cursorSpeed in px/frame, so slice thresholds tuned in 2D carry
+// straight over.
+//
 // Requires input.js to be loaded first, for getPointer(), setReference(),
 // getSensorState() and OneEuroFilter.
 
-// --- Axis mapping -----------------------------------------------------------
+// --- Aim mapping ------------------------------------------------------------
 
-// Which rotation axis drives which screen axis. Each is "yaw", "pitch", or
-// "roll" — the three Tait-Bryan angles of the phone's rotation away from its
-// reference orientation.
-//
-// TROUBLESHOOTING, in this order:
-//   Cursor moves vertically when you pan the phone sideways?  swap these two.
-//   Cursor moves the right way but backwards?                 flip the INVERT below.
-// The correct combination depends entirely on how you hold the phone, so expect
-// to try a couple.
-const POINTER_AXIS_X = "pitch";
-const POINTER_AXIS_Y = "yaw";
-
+// input.js already resolves the grip: getPointer() returns +yaw = aiming right,
+// +pitch = aiming up, regardless of how the phone is held. So the only mapping
+// left here is sign flips if a particular player prefers inverted aim.
 const POINTER_INVERT_X = false;
 const POINTER_INVERT_Y = false;
 
@@ -31,7 +33,7 @@ const POINTER_INVERT_Y = false;
 
 // Total rotation, in degrees, that spans the full width/height of the screen.
 // 90 means edge to edge is a 90° sweep — so ±45° from centre. Larger = calmer
-// and more physical movement; smaller = twitchier.
+// and more physical movement; smaller = twitchier. Tunable live with [ and ].
 const DEGREES_PER_SCREEN_X = 90;
 const DEGREES_PER_SCREEN_Y = 90;
 
@@ -45,27 +47,47 @@ const MIN_CUTOFF = 1.0;
 const BETA = 0.01;
 
 // Rotation smaller than this is treated as sensor noise and ignored outright, so
-// a phone lying still produces a perfectly stationary cursor.
+// a phone lying still produces a perfectly stationary saber.
 const POINTER_DEADZONE_DEG = 0.2;
 
-// --- Appearance -------------------------------------------------------------
+// --- 3D geometry ------------------------------------------------------------
 
-// Trail length in frames. Long enough that a flick reads as a slash, short enough
-// that it doesn't smear while aiming.
-const POINTER_TRAIL_LENGTH = 12;
+// Where the saber is "held": just right of and below screen centre, close to
+// the camera (default camera sits around z ≈ 0.87 × height, i.e. ~700-900).
+// The blade points from here through the aim point on the hit plane, which is
+// what makes the whole scene read as first-person.
+const SABER_BASE = { x: 190, y: 340, z: 560 };
+const SABER_PLANE_Z = 0; // must match HIT_PLANE_Z in sketch.js
+
+const SABER_HANDLE_LENGTH = 90; // dark grip section, world units from the base
+const SABER_BLADE_OVERSHOOT = 140; // blade extends this far past the aim point
+
+const BLADE_CORE_RADIUS = 4.5; // white-hot centre
+const BLADE_GLOW_RADIUS = 13; // translucent halo around the core
+
+// Trail length in frames. Long enough that a flick reads as a slash, short
+// enough that it doesn't smear while aiming.
+const SABER_TRAIL_LENGTH = 14;
 
 const RECENTER_FLASH_MS = 600;
 
-// --- Pointer ----------------------------------------------------------------
+// --- Saber ------------------------------------------------------------------
 
-class Pointer {
+class Saber {
   constructor(x, y) {
-    this.x = x; // on-screen position
+    this.x = x; // aim point in screen pixels (top-left origin)
     this.y = y;
     this.prevX = x; // position last frame, for velocity
     this.prevY = y;
 
-    this.cursorSpeed = 0; // px/frame the cursor is travelling
+    // Aim point in world coordinates on the hit plane (centre origin). These
+    // are what sketch.js tests blocks against.
+    this.tipX = 0;
+    this.tipY = 0;
+    this.prevTipX = 0;
+    this.prevTipY = 0;
+
+    this.cursorSpeed = 0; // px/frame the aim point is travelling
     this.gyroMag = 0; // phone rotation speed (not used for scoring)
     this.valid = false; // false until a usable quaternion arrives
 
@@ -83,7 +105,7 @@ class Pointer {
     this.heldAngleX = 0;
     this.heldAngleY = 0;
 
-    this.trail = [];
+    this.trail = []; // recent tip positions in world coords
     this.recenteredAt = -Infinity;
   }
 
@@ -96,11 +118,10 @@ class Pointer {
     if (aim.valid) {
       const now = millis();
 
-      // Pick the rotation axis feeding each screen axis, then smooth it while
-      // it's still an angle — filtering in pixels would fight the clamp at the
-      // screen edges.
-      const rawX = this.filterX.filter(aim[POINTER_AXIS_X], now);
-      const rawY = this.filterY.filter(aim[POINTER_AXIS_Y], now);
+      // Smooth while the signal is still an angle — filtering in pixels would
+      // fight the clamp at the screen edges.
+      const rawX = this.filterX.filter(aim.yaw, now);
+      const rawY = this.filterY.filter(aim.pitch, now);
 
       const angleX = this.applyDeadzone(rawX, "heldAngleX");
       const angleY = this.applyDeadzone(rawY, "heldAngleY");
@@ -110,9 +131,10 @@ class Pointer {
       const halfRangeY = radians(this.degreesPerScreenY / 2);
 
       const nx = (POINTER_INVERT_X ? -angleX : angleX) / halfRangeX;
-      const ny = (POINTER_INVERT_Y ? -angleY : angleY) / halfRangeY;
+      // +pitch = aiming up, but screen y grows downward, hence the minus.
+      const ny = (POINTER_INVERT_Y ? angleY : -angleY) / halfRangeY;
 
-      // Clamp to the canvas so the cursor can't be lost off-screen — with a
+      // Clamp to the canvas so the aim point can't be lost off-screen — with a
       // relative reference it would otherwise be hard to find again.
       this.x = constrain(width / 2 + nx * (width / 2), 0, width);
       this.y = constrain(height / 2 + ny * (height / 2), 0, height);
@@ -120,8 +142,15 @@ class Pointer {
 
     this.cursorSpeed = dist(this.x, this.y, this.prevX, this.prevY);
 
-    this.trail.push({ x: this.x, y: this.y });
-    if (this.trail.length > POINTER_TRAIL_LENGTH) this.trail.shift();
+    // Screen px -> world units on the z = 0 hit plane (1:1 under the default
+    // camera; WEBGL's origin is the screen centre).
+    this.prevTipX = this.prevX - width / 2;
+    this.prevTipY = this.prevY - height / 2;
+    this.tipX = this.x - width / 2;
+    this.tipY = this.y - height / 2;
+
+    this.trail.push({ x: this.tipX, y: this.tipY });
+    if (this.trail.length > SABER_TRAIL_LENGTH) this.trail.shift();
 
     this.prevX = this.x;
     this.prevY = this.y;
@@ -163,70 +192,109 @@ class Pointer {
     this.filterY.setMinCutoff(this.minCutoff);
   }
 
-  // --- Drawing --------------------------------------------------------------
+  // --- Drawing (WEBGL) -------------------------------------------------------
 
   draw() {
-    this.drawTrail();
-    this.drawCrosshair();
-    this.drawRecenterFlash();
+    // Dimmed until real orientation data flows, so a dead sensor is obvious
+    // rather than looking like a saber stuck at centre.
+    const vis = this.valid ? 1 : 0.35;
+
+    this.drawTrail(vis);
+
+    const base = [SABER_BASE.x, SABER_BASE.y, SABER_BASE.z];
+    const aim = [this.tipX, this.tipY, SABER_PLANE_Z];
+
+    // Unit vector from the hand toward the aim point — the blade's direction.
+    let dx = aim[0] - base[0];
+    let dy = aim[1] - base[1];
+    let dz = aim[2] - base[2];
+    const len = Math.hypot(dx, dy, dz) || 1;
+    dx /= len;
+    dy /= len;
+    dz /= len;
+
+    const handleEnd = [
+      base[0] + dx * SABER_HANDLE_LENGTH,
+      base[1] + dy * SABER_HANDLE_LENGTH,
+      base[2] + dz * SABER_HANDLE_LENGTH,
+    ];
+    const bladeEnd = [
+      aim[0] + dx * SABER_BLADE_OVERSHOOT,
+      aim[1] + dy * SABER_BLADE_OVERSHOOT,
+      aim[2] + dz * SABER_BLADE_OVERSHOOT,
+    ];
+
+    noStroke();
+
+    // Handle: dark, matte, barely emissive so it never disappears into the bg.
+    emissiveMaterial(38, 40, 52);
+    this.beam(base, handleEnd, 10);
+
+    // Glow first (bigger, translucent), then the white-hot core on top.
+    // emissiveMaterial ignores scene lights — that IS the neon look.
+    emissiveMaterial(120, 220, 255, 80 * vis);
+    this.beam(handleEnd, bladeEnd, BLADE_GLOW_RADIUS);
+
+    emissiveMaterial(255, 255, 255, 235 * vis);
+    this.beam(handleEnd, bladeEnd, BLADE_CORE_RADIUS);
+
+    // Reticle at the aim point on the hit plane — this is "the cursor".
+    push();
+    translate(aim[0], aim[1], aim[2]);
+    emissiveMaterial(120, 220, 255, 90 * vis);
+    sphere(14, 12, 8);
+    emissiveMaterial(255, 255, 255, 255 * vis);
+    sphere(6, 10, 6);
+    pop();
   }
 
-  // The trail is what makes a fast flick read as a slash rather than a teleport.
-  drawTrail() {
-    noFill();
+  // Draw a cylinder spanning two points in 3D.
+  //
+  // p5's cylinder() is built along the local Y axis, centred at the origin, so
+  // drawing between arbitrary points a and b takes three steps:
+  //   1. translate to the segment's midpoint,
+  //   2. rotate the local Y axis onto the segment direction d — the rotation
+  //      axis is  yhat × d = (d.z, 0, -d.x)  and the angle is  acos(yhat · d)
+  //      = acos(d.y),
+  //   3. draw a cylinder whose height is the segment length.
+  beam(a, b, radius) {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let dz = b[2] - a[2];
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-6) return;
+    dx /= len;
+    dy /= len;
+    dz /= len;
+
+    push();
+    translate((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2);
+
+    const angle = Math.acos(constrain(dy, -1, 1));
+    const axisX = dz;
+    const axisZ = -dx;
+    if (Math.hypot(axisX, axisZ) > 1e-6) {
+      rotate(angle, [axisX, 0, axisZ]);
+    } else if (dy < 0) {
+      // d is anti-parallel to Y: cross product vanishes; any perpendicular
+      // axis works for the 180° flip.
+      rotate(PI, [1, 0, 0]);
+    }
+
+    cylinder(radius, len, 12, 1);
+    pop();
+  }
+
+  // The trail lives on the hit plane and is what makes a fast flick read as a
+  // slash rather than a teleport.
+  drawTrail(vis) {
     for (let i = 1; i < this.trail.length; i++) {
-      const fade = i / this.trail.length;
+      const fade = (i / this.trail.length) * vis;
       stroke(120, 220, 255, 200 * fade * fade);
       strokeWeight(10 * fade);
-      line(this.trail[i - 1].x, this.trail[i - 1].y, this.trail[i].x, this.trail[i].y);
+      // z = 2: a hair in front of the hit plane so it never z-fights the frame.
+      line(this.trail[i - 1].x, this.trail[i - 1].y, 2, this.trail[i].x, this.trail[i].y, 2);
     }
-  }
-
-  drawCrosshair() {
-    push();
-    translate(this.x, this.y);
-
-    // Dimmed until real orientation data is flowing, so a dead sensor is obvious
-    // rather than looking like a cursor stuck at centre.
-    const alpha = this.valid ? 255 : 70;
-    const arm = 14;
-
-    stroke(235, 250, 255, alpha);
-    strokeWeight(2);
-    line(-arm, 0, -5, 0);
-    line(5, 0, arm, 0);
-    line(0, -arm, 0, -5);
-    line(0, 5, 0, arm);
-
-    noFill();
-    stroke(120, 220, 255, alpha);
-    strokeWeight(2);
-    circle(0, 0, 26);
-
     noStroke();
-    fill(255, 255, 255, alpha);
-    circle(0, 0, 6);
-    pop();
-  }
-
-  drawRecenterFlash() {
-    const since = millis() - this.recenteredAt;
-    if (since > RECENTER_FLASH_MS) return;
-
-    const t = since / RECENTER_FLASH_MS;
-
-    // Ring expanding from screen centre — where the cursor has just been sent.
-    push();
-    noFill();
-    stroke(120, 240, 180, 220 * (1 - t));
-    strokeWeight(3);
-    circle(width / 2, height / 2, 40 + t * 160);
-
-    noStroke();
-    fill(120, 240, 180, 255 * (1 - t));
-    textSize(18);
-    textAlign(CENTER, CENTER);
-    text("RECENTERED", width / 2, height / 2 + 60);
-    pop();
   }
 }
